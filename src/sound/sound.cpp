@@ -65,6 +65,9 @@ bool EspSound::playSample(const int16_t* data, size_t samples)
     {
         return false;
     }
-    M5.Speaker.playRaw(data, samples, config_.sampleRate, config_.channels);
+    // ВАЖНО: четвёртый параметр playRaw — bool stereo. Число каналов (1) в
+    // него передавать нельзя: 1 == true, и моно-PCM играется как стерео
+    // (скорость x2, «мышиный» голос). У нас всегда моно.
+    M5.Speaker.playRaw(data, samples, config_.sampleRate, false);
     return true;
 }

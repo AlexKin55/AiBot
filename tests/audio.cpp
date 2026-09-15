@@ -10,7 +10,7 @@
 #include <algorithm>
 #include <vector>
 
-#include "app_config.h"
+#include "config/test_config.h"
 #include "microfon/microfon.h"
 #include "sound/sound.h"
 #include "test_util.h"

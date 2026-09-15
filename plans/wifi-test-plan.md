@@ -14,8 +14,8 @@
 ```text
 AiBot/
 ├── platformio.ini
-├── include/
-│   └── app_config.h          # SSID/PASS/таймауты (переопределяемы через -D)
+├── config/
+│   └── config.h              # SSID/PASS/таймауты (переопределяемы через -D)
 ├── src/
 │   └── wifi/
 │       ├── wifi.h            # IWifiManager (абстракция) + EspWifiManager
@@ -66,7 +66,7 @@ build_unflags =
 `src/wifi/wifi.cpp` — реализация на Arduino `<WiFi.h>` (режим STA, ожидание
 подключения с таймаутом, возврат `WL_CONNECTED`).
 
-`include/app_config.h` — настраиваемые `WIFI_SSID`, `WIFI_PASS`,
+`config/config.h` — настраиваемые `WIFI_SSID`, `WIFI_PASS`,
 `WIFI_CONNECT_TIMEOUT_MS` (переопределяются флагами `-D`).
 
 ## Сценарии теста (tests/wifi.cpp)

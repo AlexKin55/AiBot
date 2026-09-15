@@ -26,7 +26,15 @@ EspMicrophone gMic;
 
 const uint8_t kAudioFrameType = 1;
 const uint8_t kAudioCodecPcm = 1;
+const uint8_t kAudioCodecOpus = 2;
 std::vector<uint8_t> gAudioFrame;
+
+// Захват микрофона (см. app.h): чанк-буфер упакованных Opus-пакетов.
+std::vector<uint8_t> gAudioChunk;
+size_t gAudioChunkMaxBytes = 0;
+unsigned gAudioChunkPackets = 0;
+unsigned gAudioChunkMaxPackets = 0;
+bool gAudioCapturing = false;
 
 void setup()
 {

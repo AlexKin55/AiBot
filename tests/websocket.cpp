@@ -9,7 +9,7 @@
 
 #include <string>
 
-#include "app_config.h"
+#include "config/test_config.h"
 #include "test_util.h"
 #include "websocket/websocket.h"
 #include "wifi/wifi.h"

@@ -7,7 +7,7 @@
 
 #include <Arduino.h>
 
-#include "app_config.h"
+#include "config/test_config.h"
 #include "move/move.h"
 #include "test_util.h"
 

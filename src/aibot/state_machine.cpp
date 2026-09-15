@@ -7,7 +7,7 @@
 #include <WiFi.h>
 
 #include "app.h"
-#include "app_config.h"
+#include "config/config.h"
 #include "protocol/protocol.h"
 
 AppState gState = AppState::kPowerUp;

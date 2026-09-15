@@ -17,23 +17,26 @@ bool EspMicrophone::begin(const Config& config)
     prev_.resize(config.frameSamples);
 
     // Настройки из рабочего примера (см. example/mic_m5.cpp):
-    //   - magnification 128: без усиления сигнал с микрофона близок к нулю;
+    //   - усиление задаётся config.magnification: без него сигнал с микрофона
+    //     близок к нулю, а слишком большое (128) клиппит речь вблизи;
     //   - на CoreS3 микрофон и динамик делят I2S, поэтому динамик отключаем
     //     перед запуском микрофона, иначе читаются нули.
     auto micCfg = M5.Mic.config();
     micCfg.sample_rate = config.sampleRate;
     micCfg.stereo = false;
-    micCfg.magnification = 128;
-    micCfg.over_sampling = 1;
+    micCfg.magnification = config.magnification;
+    micCfg.over_sampling = config.overSampling;
     M5.Mic.config(micCfg);
     if (M5.Speaker.isEnabled())
     {
         M5.Speaker.end();
     }
     const bool ok = M5.Mic.begin();
-    Serial.printf("[mic] begin ok=%d rate=%u ch=%u frame=%u\n",
+    Serial.printf("[mic] begin ok=%d rate=%u ch=%u frame=%u mag=%u os=%u\n",
                   ok, static_cast<unsigned>(config.sampleRate),
-                  config.channels, static_cast<unsigned>(config.frameSamples));
+                  config.channels, static_cast<unsigned>(config.frameSamples),
+                  static_cast<unsigned>(config.magnification),
+                  static_cast<unsigned>(config.overSampling));
     return ok;
 }
 
@@ -64,8 +67,20 @@ bool EspMicrophone::start(AudioCallback cb)
 void EspMicrophone::stop()
 {
     running_ = false;
+    // Кооперативная остановка: задача может находиться внутри блокирующего
+    // M5.Mic.record() (ожидание DMA-буфера, ~1 кадр = 32 мс). Убивать её через
+    // vTaskDelete нельзя — она оставляет внутренние очереди M5Unified/ESP-IDF
+    // в неконсистентном состоянии, и M5.Mic.end() падает в
+    // assert(xQueueGenericSend). Ждём, пока задача выйдет сама и обнулит task_.
+    unsigned tries = 0;
+    while (task_ != nullptr && tries < 200)
+    {
+        vTaskDelay(1);
+        ++tries;
+    }
     if (task_ != nullptr)
     {
+        // Резервный путь на случай зависания (обычно не срабатывает).
         vTaskDelete(task_);
         task_ = nullptr;
     }
@@ -91,6 +106,7 @@ void EspMicrophone::recordTask(void* arg)
 {
     auto* self = static_cast<EspMicrophone*>(arg);
     self->recordLoop();
+    // recordLoop() завершается самоудалением задачи (не возвращается).
 }
 
 void EspMicrophone::recordLoop()
@@ -172,6 +188,12 @@ void EspMicrophone::recordLoop()
         // Уступаем CPU, чтобы не блокировать сторожевой таймер.
         vTaskDelay(1);
     }
+
+    // Задача завершается кооперативно: stop() ждёт task_ == nullptr, а затем
+    // вызывает M5.Mic.end(). Самоудаление обязано идти после выхода из
+    // record(), чтобы не ломать очереди M5Unified.
+    task_ = nullptr;
+    vTaskDelete(nullptr);
 }
 
 float EspMicrophone::computeRms(const int16_t* data, size_t samples)

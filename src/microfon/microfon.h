@@ -20,7 +20,15 @@ class EspMicrophone
         uint16_t channels = 1;         // число каналов
         uint16_t frameSamples = 512;   // сэмплов в одном кадре
 
-        // Шумовой шлюз.
+        // Усиление микрофона. В M5Unified реальный коэффициент равен
+        // magnification / (overSampling * 2). Замеры на CoreS3: 128 -> x64
+        // и 64 -> x32 дают клиппинг (±32752) при разговоре вблизи, поэтому
+        // по умолчанию берём 32 (x16): пик речи ~25000-30000 без обрезания,
+        // а тихие записи дотягивает нормализация на сервере.
+        uint8_t magnification = 32;
+        uint8_t overSampling = 1;
+
+        // Шумовой шлюз (для сценариев VAD). Для захвата звука отключайте.
         bool noiseGateEnabled = true;
         float noiseGateThreshold = 100.0f;  // порог по RMS, int16-шкала
         uint16_t hangoverFrames = 4;

@@ -7,7 +7,7 @@
 #include <Arduino.h>
 #include <WiFi.h>
 
-#include "app_config.h"
+#include "config/test_config.h"
 #include "test_util.h"
 #include "wifi/wifi.h"
 

@@ -6,7 +6,7 @@
 
 #include <Arduino.h>
 
-#include "app_config.h"
+#include "config/test_config.h"
 #include "camera/camera.h"
 #include "screen/screen.h"
 #include "test_util.h"
