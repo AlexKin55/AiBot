@@ -49,6 +49,20 @@ void EspSound::stop()
     }
 }
 
+bool EspSound::ensureReady()
+{
+    // Переключение общей I2S-шины CoreS3 на динамик: освобождаем порт от
+    // микрофона (если он ещё слушает) и заводим динамик. M5.Speaker.begin()
+    // идемпотентен и сам переключает кодек (AW88298).
+    if (M5.Mic.isRunning())
+    {
+        M5.Mic.end();
+        vTaskDelay(pdMS_TO_TICKS(20));  // дать драйверу освободить порт
+    }
+    enabled_ = M5.Speaker.begin();
+    return enabled_;
+}
+
 bool EspSound::playTone(uint16_t frequencyHz, uint16_t durationMs)
 {
     if (!enabled_)
@@ -68,6 +82,11 @@ bool EspSound::playSample(const int16_t* data, size_t samples)
     // ВАЖНО: четвёртый параметр playRaw — bool stereo. Число каналов (1) в
     // него передавать нельзя: 1 == true, и моно-PCM играется как стерео
     // (скорость x2, «мышиный» голос). У нас всегда моно.
-    M5.Speaker.playRaw(data, samples, config_.sampleRate, false);
+    //
+    // Канал фиксируем (0) и не прерываем текущий звук: все PCM-чанки одной
+    // озвучки встают в очередь одного потока воспроизведения без пауз и
+    // щелчков на стыках (при channel=-1 каждый playRaw заводил бы новый
+    // поток, и чанки накладывались/щёлкали).
+    M5.Speaker.playRaw(data, samples, config_.sampleRate, false, 1, 0, false);
     return true;
 }

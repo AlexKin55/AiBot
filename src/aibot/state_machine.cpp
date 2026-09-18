@@ -1,4 +1,4 @@
-// State machine прошивки робота: Wi-Fi подключение, WebSocket, heartbeat,
+// State machine прошивки робота: Wi-Fi подключение, WebSocket,
 // восстановление связи.
 
 #include "state_machine.h"
@@ -12,7 +12,6 @@
 
 AppState gState = AppState::kPowerUp;
 unsigned long gLastAttempt = 0;    // время последней попытки (wifi/ws)
-unsigned long gLastHeartbeat = 0;  // время последнего STATUS
 
 namespace {
 
@@ -104,13 +103,6 @@ void tickStateMachine()
                 gWs.disconnect();
                 transition(AppState::kWifiLost);
                 break;
-            }
-            // Периодический heartbeat на сервер.
-            if (WS_HEARTBEAT_INTERVAL_MS > 0 &&
-                millis() - gLastHeartbeat >= WS_HEARTBEAT_INTERVAL_MS)
-            {
-                gLastHeartbeat = millis();
-                gWs.sendText(protocol::statusOnline());
             }
             break;
 

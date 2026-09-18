@@ -9,7 +9,6 @@
 //
 // Формат команд (сервер -> робот):
 //   PING
-//   STATUS
 //   EMOTION:<name>              name = neutral|happy|angry|sad|doubt|sleepy
 //   MOVE:left|right|up|down:<deg>
 //   MOVE:center
@@ -20,14 +19,15 @@
 //   ACK:<COMMAND>[:args]        команда выполнена
 //   ERR:<COMMAND>:<reason>      ошибка
 //   PONG:<uptime_ms>            ответ на PING
-//   STATUS:online               heartbeat/статус
+//   RECORD:start | RECORD:stop  VAD: робот сам управляет записью
+//   HB                          heartbeat каждые 15 с: сервер логирует,
+//                               соединение при отсутствии HB не обрывается
 namespace protocol {
 
 enum class CommandType
 {
     Unknown,
     Ping,
-    Status,
     Emotion,
     Move,
     Led,
@@ -70,8 +70,9 @@ std::string response(const Command& cmd, bool ok, const char* reason = nullptr);
 // Ответ на PING: "PONG:<uptime_ms>".
 std::string pong(uint32_t uptimeMs);
 
-// Heartbeat/статус: "STATUS:online".
-std::string statusOnline();
+// Heartbeat-сообщение робота: "HB" (шлётся каждые 15 с, чтобы канал не
+// простаивал; сервер только логирует и не обрывает соединение).
+std::string heartbeat();
 
 }  // namespace protocol
 

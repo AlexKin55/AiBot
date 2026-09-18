@@ -4,6 +4,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <mutex>
 #include <string>
 
 #include <WebSocketsClient.h>
@@ -44,6 +45,13 @@ class EspWebsocketClient
 
     private:
     void handleEvent(WStype_t type, uint8_t* payload, size_t length);
+
+    // Мьютекс ВСЕХ операций WebSocketsClient (отправка и приём): PCM-чанки
+    // шлются из I2S-задачи микрофона, а текстовые команды/ACK и m_ws.loop()
+    // (приём) — из loopTask. Библиотека WebSockets не потокобезопасна.
+    // Рекурсивный: loop() вызывает колбэки, которые отправляют ACK через
+    // тот же мьютекс (повторный захват тем же потоком разрешён).
+    std::recursive_mutex m_wsMutex;
 
     WebSocketsClient m_ws;
     ConnectedCallback m_onConnected;

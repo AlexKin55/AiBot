@@ -6,7 +6,7 @@
 //   kWifiConnecting -> подключение к точке доступа (с ретраями)
 //   kWifiReady      -> инициализация WebSocket-клиента
 //   kConnecting     -> ожидание CONNECTED от сервера
-//   kReady          -> обмен данными: приём команд, heartbeat
+//   kReady          -> обмен данными: приём команд, аудио
 //   kWifiLost       -> потеря связи, переподключение Wi-Fi
 enum class AppState
 {

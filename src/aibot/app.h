@@ -23,21 +23,20 @@ extern EspLeds gLeds;
 extern EspMicrophone gMic;
 
 // Бинарный фрейм аудио: byte[0]=тип, byte[1]=кодек, далее данные.
-// Кодек 1 = сырой PCM int16 LE; кодек 2 = Opus-пакеты [u16le len][opus ...].
+// Единственный кодек = 1: сырые PCM-сэмплы (int16 LE, 16 кГц/моно).
 extern const uint8_t kAudioFrameType;
 extern const uint8_t kAudioCodecPcm;
-extern const uint8_t kAudioCodecOpus;
 extern std::vector<uint8_t> gAudioFrame;
 
-// Захват микрофона (команда AUDIO:start): PCM кодируется в Opus (20 мс) и
-// копится в чанк-буфер, который отправляется пакетами по
-// MIC_AUDIO_CHUNK_SECONDS. Непрерывный стриминг по Wi-Fi во время записи
-// даёт помехи I2S на CoreS3 (скрипы/свисты), а Opus ещё и в ~10 раз меньше
-// трафика. По AUDIO:stop отправляется последний неполный чанк.
-extern std::vector<uint8_t> gAudioChunk;    // упакованные Opus-пакеты
+// Захват микрофона (VAD-сегмент): PCM-байты копятся в чанк-буфер, который
+// отправляется пакетами по MIC_AUDIO_CHUNK_SECONDS. Непрерывный стриминг по
+// Wi-Fi во время записи даёт помехи I2S на CoreS3 (скрипы/свисты), поэтому
+// звук копится локально и уходит пакетами. По RECORD:stop отправляется
+// последний неполный чанк.
+extern std::vector<uint8_t> gAudioChunk;    // сырые PCM-байты (int16 LE)
 extern size_t gAudioChunkMaxBytes;          // лимит чанка, байт
-extern unsigned gAudioChunkPackets;         // пакетов в текущем чанке
-extern unsigned gAudioChunkMaxPackets;      // лимит пакетов в чанке
+extern unsigned gAudioChunkPackets;         // кадров в текущем чанке
+extern unsigned gAudioChunkMaxPackets;      // лимит кадров в чанке
 extern bool gAudioCapturing;                // идёт накопление
 
 #endif  // AIBOT_APP_H_

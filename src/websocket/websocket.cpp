@@ -19,26 +19,38 @@ bool EspWebsocketClient::connect(const char* host, uint16_t port, const char* pa
 
 bool EspWebsocketClient::isConnected()
 {
+    std::lock_guard<std::recursive_mutex> lock(m_wsMutex);
     return m_ws.isConnected();
 }
 
 void EspWebsocketClient::disconnect()
 {
+    std::lock_guard<std::recursive_mutex> lock(m_wsMutex);
     m_ws.disconnect();
 }
 
 bool EspWebsocketClient::sendText(const std::string& text)
 {
+    // Сериализуем все операции WebSocketsClient из разных задач
+    // (I2S-микрофон шлёт PCM, loopTask шлёт текст/ACK и принимает данные):
+    // библиотека не потокобезопасна.
+    std::lock_guard<std::recursive_mutex> lock(m_wsMutex);
     return m_ws.sendTXT(text.c_str());
 }
 
 bool EspWebsocketClient::sendBinary(const uint8_t* data, size_t size)
 {
+    std::lock_guard<std::recursive_mutex> lock(m_wsMutex);
     return m_ws.sendBIN(data, size);
 }
 
 void EspWebsocketClient::loop()
 {
+    // Приём данных тоже под мьютексом: пока I2S-задача отправляет PCM-чанк,
+    // loopTask ждёт завершения отправки, и наоборот. Рекурсивный мьютекс
+    // позволяет колбэкам (вызываются внутри m_ws.loop()) слать ACK/ответы
+    // без дедлока.
+    std::lock_guard<std::recursive_mutex> lock(m_wsMutex);
     m_ws.loop();
 }
 

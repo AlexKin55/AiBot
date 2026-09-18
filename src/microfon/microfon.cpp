@@ -19,17 +19,20 @@ bool EspMicrophone::begin(const Config& config)
     // Настройки из рабочего примера (см. example/mic_m5.cpp):
     //   - усиление задаётся config.magnification: без него сигнал с микрофона
     //     близок к нулю, а слишком большое (128) клиппит речь вблизи;
-    //   - на CoreS3 микрофон и динамик делят I2S, поэтому динамик отключаем
-    //     перед запуском микрофона, иначе читаются нули.
+    //   - на CoreS3 микрофон и динамик делят I2S-шину и кодеки (ES7210 /
+    //     AW88298). Mic.begin() на занятой динамиком шине падает
+    //     («register I2S object to platform failed») и дальше крашится,
+    //     поэтому сначала освобождаем динамик.
     auto micCfg = M5.Mic.config();
     micCfg.sample_rate = config.sampleRate;
     micCfg.stereo = false;
     micCfg.magnification = config.magnification;
     micCfg.over_sampling = config.overSampling;
     M5.Mic.config(micCfg);
-    if (M5.Speaker.isEnabled())
+    if (M5.Speaker.isRunning())
     {
         M5.Speaker.end();
+        vTaskDelay(pdMS_TO_TICKS(20));  // дать драйверу освободить порт
     }
     const bool ok = M5.Mic.begin();
     Serial.printf("[mic] begin ok=%d rate=%u ch=%u frame=%u mag=%u os=%u\n",
@@ -51,6 +54,15 @@ bool EspMicrophone::start(AudioCallback cb)
     if (running_)
         return true;
 
+    // Перед захватом микрофона освобождаем шину от динамика и заводим
+    // микрофон (M5.Mic.begin() сам переключает кодеки CoreS3 на ES7210).
+    if (M5.Speaker.isRunning())
+    {
+        M5.Speaker.end();
+        vTaskDelay(pdMS_TO_TICKS(20));  // дать драйверу освободить порт
+    }
+    M5.Mic.begin();
+
     cb_ = std::move(cb);
     havePrev_ = false;
     running_ = true;
@@ -70,8 +82,7 @@ void EspMicrophone::stop()
     // Кооперативная остановка: задача может находиться внутри блокирующего
     // M5.Mic.record() (ожидание DMA-буфера, ~1 кадр = 32 мс). Убивать её через
     // vTaskDelete нельзя — она оставляет внутренние очереди M5Unified/ESP-IDF
-    // в неконсистентном состоянии, и M5.Mic.end() падает в
-    // assert(xQueueGenericSend). Ждём, пока задача выйдет сама и обнулит task_.
+    // в неконсистентном состоянии. Ждём, пока задача выйдет сама и обнулит task_.
     unsigned tries = 0;
     while (task_ != nullptr && tries < 200)
     {
@@ -84,6 +95,8 @@ void EspMicrophone::stop()
         vTaskDelete(task_);
         task_ = nullptr;
     }
+    // Освобождаем I2S-шину для динамика (переключение кодека на AW88298
+    // произойдёт в EspSound::ensureReady() при следующей озвучке).
     M5.Mic.end();
 }
 

@@ -75,12 +75,6 @@ Command parse(const char* text, size_t length)
         cmd.valid = true;
         return cmd;
     }
-    if (key == "STATUS")
-    {
-        cmd.type = CommandType::Status;
-        cmd.valid = true;
-        return cmd;
-    }
     if (key == "EMOTION")
     {
         cmd.type = CommandType::Emotion;
@@ -155,7 +149,6 @@ const char* typeName(CommandType type)
     switch (type)
     {
         case CommandType::Ping: return "PING";
-        case CommandType::Status: return "STATUS";
         case CommandType::Emotion: return "EMOTION";
         case CommandType::Move: return "MOVE";
         case CommandType::Led: return "LED";
@@ -188,7 +181,6 @@ std::string response(const Command& cmd, bool ok, const char* reason)
         case CommandType::Audio:
             return cmd.audioStart ? "ACK:AUDIO:start" : "ACK:AUDIO:stop";
         case CommandType::Ping:
-        case CommandType::Status:
         default:
             return "ACK:" + std::string(typeName(cmd.type));
     }
@@ -199,9 +191,9 @@ std::string pong(uint32_t uptimeMs)
     return "PONG:" + std::to_string(uptimeMs);
 }
 
-std::string statusOnline()
+std::string heartbeat()
 {
-    return "STATUS:online";
+    return "HB";
 }
 
 }  // namespace protocol

@@ -7,6 +7,7 @@
 
 #include <Arduino.h>
 #include <WiFi.h>
+#include <esp_system.h>
 
 #include <vector>
 
@@ -26,10 +27,9 @@ EspMicrophone gMic;
 
 const uint8_t kAudioFrameType = 1;
 const uint8_t kAudioCodecPcm = 1;
-const uint8_t kAudioCodecOpus = 2;
 std::vector<uint8_t> gAudioFrame;
 
-// Захват микрофона (см. app.h): чанк-буфер упакованных Opus-пакетов.
+// Захват микрофона (см. app.h): чанк-буфер сырых PCM-байтов (int16 LE).
 std::vector<uint8_t> gAudioChunk;
 size_t gAudioChunkMaxBytes = 0;
 unsigned gAudioChunkPackets = 0;
@@ -44,6 +44,21 @@ void setup()
     Serial.println();
     Serial.println("[app] AIBot firmware started");
     Serial.printf("[app] chip model: %s\n", ESP.getChipModel());
+
+    // Диагностика: причина последней перезагрузки (краш/watchdog/brownout).
+    const char* reset_reason = "other";
+    switch (esp_reset_reason())
+    {
+        case ESP_RST_POWERON: reset_reason = "power-on"; break;
+        case ESP_RST_SW: reset_reason = "software reset"; break;
+        case ESP_RST_PANIC: reset_reason = "panic (crash)"; break;
+        case ESP_RST_INT_WDT: reset_reason = "interrupt watchdog"; break;
+        case ESP_RST_TASK_WDT: reset_reason = "task watchdog"; break;
+        case ESP_RST_WDT: reset_reason = "watchdog"; break;
+        case ESP_RST_BROWNOUT: reset_reason = "brownout"; break;
+        default: break;
+    }
+    Serial.printf("[app] last reset reason: %s\n", reset_reason);
 
     // Не даём Wi-Fi-стеку уходить в глубокий сон.
     WiFi.setSleep(false);
@@ -96,5 +111,6 @@ void setup()
 void loop()
 {
     tickStateMachine();
+    tickAudio();  // VAD: прослушивание микрофона и автозапись речи
     delay(10);
 }
