@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <deque>
 #include <freertos/queue.h>
 #include <string>
 
@@ -107,6 +108,16 @@ void playbackTask(void* /*arg*/)
     // Весь чанк одним вызовом playSample: он ждёт окончания текущего звука,
     // поэтому дробление на мелкие куски давало бы серию щелчков.
     // Чанк 2 с = 64 КБ PCM.
+    //
+    // ВАЖНО: M5.Speaker.playRaw НЕ копирует данные — задача динамика читает
+    // сэмплы напрямую из буфера чанка, пока тот играется. Удалять буфер сразу
+    // после playSample нельзя (use-after-free: чтение освобождённой кучи даёт
+    // треск/заикание). Освобождение делаем ПО ФАКТУ ПРОЧТЕНИЯ:
+    // M5.Speaker.isPlaying(0) возвращает число чанков, чьи данные динамик
+    // ещё держит (published/playing, максимум 2). Все опубликованные ранее —
+    // гарантированно доиграны, их буферы можно удалять сразу.
+    std::deque<PlaybackMsg*> inflight;  // опубликованные в M5 чанки (по порядку)
+
     while (true)
     {
         PlaybackMsg* msg = nullptr;
@@ -120,6 +131,8 @@ void playbackTask(void* /*arg*/)
             // включить микрофон раньше, он услышит остаток ответа и VAD
             // запустит ложный сегмент («эхо» — голос повторяется).
             waitSpeakerIdle();
+            for (auto* m : inflight) { delete m; }
+            inflight.clear();
             Serial.println("[audio] playback idle timeout, mic back to VAD");
             continue;
         }
@@ -136,6 +149,7 @@ void playbackTask(void* /*arg*/)
             if (!gSound.ensureReady())
             {
                 Serial.println("[audio] speaker not ready, chunk skipped");
+                delete msg;
             }
             else
             {
@@ -147,6 +161,18 @@ void playbackTask(void* /*arg*/)
                     "[audio] played pcm chunk: %u samples (%.2f s)\n",
                     static_cast<unsigned>(count),
                     static_cast<double>(count) / MIC_SAMPLE_RATE);
+
+                inflight.push_back(msg);
+                // Сколько чанков динамик сейчас реально читает/держит.
+                const size_t flying = M5.Speaker.isPlaying(0);
+                // Освобождаем все, кроме самой свежей тройки (минимум один —
+                // только что опубликованный): остальные прочитаны полностью.
+                const size_t keep = std::max<size_t>(flying, 1u);
+                while (inflight.size() > keep)
+                {
+                    delete inflight.front();
+                    inflight.pop_front();
+                }
             }
         }
         else
@@ -156,9 +182,11 @@ void playbackTask(void* /*arg*/)
             // (иначе микрофон услышит остаток ответа -> ложный сегмент/эхо).
             resetPlaybackState();
             waitSpeakerIdle();
+            for (auto* m : inflight) { delete m; }
+            inflight.clear();
+            delete msg;
             Serial.println("[audio] playback done (eof), mic back to VAD");
         }
-        delete msg;
     }
 }
 
