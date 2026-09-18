@@ -3,6 +3,8 @@
 #include <algorithm>
 #include <cmath>
 
+#include "log/log.h"
+
 EspMicrophone::~EspMicrophone()
 {
     stop();
@@ -35,11 +37,11 @@ bool EspMicrophone::begin(const Config& config)
         vTaskDelay(pdMS_TO_TICKS(20));  // дать драйверу освободить порт
     }
     const bool ok = M5.Mic.begin();
-    Serial.printf("[mic] begin ok=%d rate=%u ch=%u frame=%u mag=%u os=%u\n",
-                  ok, static_cast<unsigned>(config.sampleRate),
-                  config.channels, static_cast<unsigned>(config.frameSamples),
-                  static_cast<unsigned>(config.magnification),
-                  static_cast<unsigned>(config.overSampling));
+    LOG_I("[mic] begin ok=%d rate=%u ch=%u frame=%u mag=%u os=%u\n",
+          ok, static_cast<unsigned>(config.sampleRate),
+          config.channels, static_cast<unsigned>(config.frameSamples),
+          static_cast<unsigned>(config.magnification),
+          static_cast<unsigned>(config.overSampling));
     return ok;
 }
 
@@ -153,8 +155,8 @@ void EspMicrophone::recordLoop()
                 if (a > peak)
                     peak = a;
             }
-            Serial.printf("[mic] rms=%d peak=%d gate_thr=%d\n", static_cast<int>(rms),
-                          peak, static_cast<int>(config_.noiseGateThreshold));
+            LOG_D("[mic] rms=%d peak=%d gate_thr=%d\n", static_cast<int>(rms),
+                  peak, static_cast<int>(config_.noiseGateThreshold));
         }
 
         if (noiseCb_)

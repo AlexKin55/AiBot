@@ -7,6 +7,7 @@
 #include <M5Unified.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cstring>
 #include <deque>
 #include <freertos/queue.h>
@@ -15,6 +16,7 @@
 #include "app.h"
 #include "config/config.h"
 #include "leds/leds.h"
+#include "log/log.h"
 #include "microfon/microfon.h"
 #include "move/move.h"
 #include "protocol/protocol.h"
@@ -148,7 +150,7 @@ void playbackTask(void* /*arg*/)
             // (микрофон выключает его при переключении общего I2S на CoreS3).
             if (!gSound.ensureReady())
             {
-                Serial.println("[audio] speaker not ready, chunk skipped");
+                LOG_W("[audio] speaker not ready, chunk skipped\n");
                 delete msg;
             }
             else
@@ -157,10 +159,9 @@ void playbackTask(void* /*arg*/)
                     reinterpret_cast<const int16_t*>(data);
                 const size_t count = size / sizeof(int16_t);
                 gSound.playSample(samples, count);
-                Serial.printf(
-                    "[audio] played pcm chunk: %u samples (%.2f s)\n",
-                    static_cast<unsigned>(count),
-                    static_cast<double>(count) / MIC_SAMPLE_RATE);
+                LOG_D("[audio] played pcm chunk: %u samples (%.2f s)\n",
+                      static_cast<unsigned>(count),
+                      static_cast<double>(count) / MIC_SAMPLE_RATE);
 
                 inflight.push_back(msg);
                 // Сколько чанков динамик сейчас реально читает/держит.
@@ -264,6 +265,12 @@ bool gVadActive = false;        // идёт VAD-сегмент записи
 uint32_t gVadSegStartMs = 0;    // время начала сегмента
 uint32_t gVadSpeechMs = 0;      // время последнего «речевого» кадра
 unsigned gVadStartCount = 0;    // кадры подряд выше порога
+
+// Флаг «голова двигается»: ставит motionTask (ядро 0), снимает по завершении
+// серии движений. Читает только loopTask (tickAudioInternal) — микрофон/VAD
+// во время движения останавливаются именно там, чтобы все изменения общего
+// состояния микрофона жили в одной задаче без гонок.
+std::atomic<bool> gMoveInProgress{false};
 
 // Снимает блокировку VAD и возвращает детекцию в исходное состояние —
 // после озвучки робот начинает слушать «с чистого листа» (иначе застывшие
@@ -429,6 +436,21 @@ void tickAudioInternal()
         resetPlaybackState();
         Serial.println("[audio] answer wait timeout, mic back to VAD");
     }
+    // Во время движения сервоприводы гудят — микрофон слышит их как речь:
+    // останавливаем запись и держим микрофон выключенным, пока голова
+    // двигается; слушать начнём в следующем тике после снятия флага.
+    if (gMoveInProgress.load(std::memory_order_relaxed))
+    {
+        if (gVadActive)
+        {
+            stopSegment();  // корректно закрыть активную запись
+        }
+        if (gMic.isRunning())
+        {
+            gMic.stop();
+        }
+        return;
+    }
     ensureMicListening();
     tickVad();
 }
@@ -464,6 +486,96 @@ void onWsDisconnected(uint16_t code, const std::string& reason)
     }
 }
 
+// ---------------------------------------------------------------------------
+// Движения головы выполняются в отдельной задаче. EspMovement::apply()
+// ждёт завершения поворота синхронно (waitMotion, до 1.5 с): если звать его
+// прямо из обработчика WebSocket, на время движения замирает приём PCM-чанков
+// (m_ws.loop() не вызывается) и звук заикается — например, танец во время
+// озвучки.
+//
+// Мьютексы/синхронизация: motionTask трогает ТОЛЬКО свои ресурсы — очередь
+// gMoveQ и серво (gMove). WebSocket отправка (ACK) уже под мьютексом внутри
+// gWs.sendText. Микрофон/VAD задача НЕ трогает: она лишь ставит флаг
+// gMoveInProgress, а остановку/возврат микрофона делает loopTask
+// (tickAudioInternal) — единственный владелец состояния микрофона, поэтому
+// гонок между задачами нет.
+// ---------------------------------------------------------------------------
+struct MoveCmd
+{
+    protocol::Command cmd;
+};
+
+QueueHandle_t gMoveQ = nullptr;
+
+void motionTask(void* /*arg*/)
+{
+    while (true)
+    {
+        MoveCmd* m = nullptr;
+        if (xQueueReceive(gMoveQ, &m, portMAX_DELAY) != pdTRUE)
+        {
+            continue;
+        }
+        const protocol::Command& cmd = m->cmd;
+        // Голова двигается: loopTask сам остановит запись/микрофон на время
+        // движения (см. tickAudioInternal) и вернёт его после снятия флага.
+        gMoveInProgress.store(true, std::memory_order_relaxed);
+        if (cmd.moveAxis == "center")
+        {
+            gMove.center();
+        }
+        else if (cmd.moveAxis == "left")
+        {
+            gMove.turnLeft(cmd.moveDegrees);
+        }
+        else if (cmd.moveAxis == "right")
+        {
+            gMove.turnRight(cmd.moveDegrees);
+        }
+        else if (cmd.moveAxis == "up")
+        {
+            gMove.turnUp(cmd.moveDegrees);
+        }
+        else if (cmd.moveAxis == "down")
+        {
+            gMove.turnDown(cmd.moveDegrees);
+        }
+        // Флаг держим до конца всей серии движений (пока в очереди что-то
+        // есть): микрофон не дёргается между шагами танца.
+        if (uxQueueMessagesWaiting(gMoveQ) == 0)
+        {
+            gMoveInProgress.store(false, std::memory_order_relaxed);
+        }
+        sendResponse(cmd, true);
+        delete m;
+    }
+}
+
+// Ставит команду движения в очередь motionTask (если очередь полна — отбрасывает).
+void enqueueMove(const protocol::Command& cmd)
+{
+    if (gMoveQ == nullptr)
+    {
+        gMoveQ = xQueueCreate(8, sizeof(MoveCmd*));
+        if (gMoveQ != nullptr)
+        {
+            // Приоритет 1 на ядре 0: ниже playbackTask (2), чтобы движение
+            // никогда не отбирало CPU у воспроизведения звука.
+            xTaskCreatePinnedToCore(motionTask, "motion", 8192, nullptr,
+                                    1, nullptr, 0);
+        }
+    }
+    if (gMoveQ == nullptr)
+    {
+        return;
+    }
+    auto* m = new MoveCmd{cmd};
+    if (xQueueSend(gMoveQ, &m, 0) != pdTRUE)
+    {
+        delete m;  // очередь занята — пропускаем (не накапливаем)
+    }
+}
+
 // Выполняет команду протокола и отправляет подтверждение/ошибку.
 void handleCommand(const protocol::Command& cmd)
 {
@@ -494,22 +606,10 @@ void handleCommand(const protocol::Command& cmd)
                 sendResponse(cmd, false, "invalid move");
                 break;
             }
-            // Голова будет двигаться, а сервоприводы гудят — микрофон слышит
-            // их как речь. Останавливаем запись на время движения и включаем
-            // обратно после завершения — по аналогии с воспроизведением аудио
-            // (EspMovement::apply() ждёт окончания поворота синхронно).
-            if (gVadActive)
-            {
-                stopSegment();  // корректно закрыть активную запись
-            }
-            gMic.stop();
-            if (cmd.moveAxis == "center") gMove.center();
-            else if (cmd.moveAxis == "left") gMove.turnLeft(cmd.moveDegrees);
-            else if (cmd.moveAxis == "right") gMove.turnRight(cmd.moveDegrees);
-            else if (cmd.moveAxis == "up") gMove.turnUp(cmd.moveDegrees);
-            else if (cmd.moveAxis == "down") gMove.turnDown(cmd.moveDegrees);
-            ensureMicListening();  // движение завершено — снова слушаем
-            sendResponse(cmd, true);
+            // Движение выполняется асинхронно (motionTask): синхронный
+            // поворот блокировал бы приём PCM-чанков, и звук заикался бы
+            // (особенно заметно при танце во время озвучки).
+            enqueueMove(cmd);
             break;
         }
         case protocol::CommandType::Led:
@@ -563,19 +663,19 @@ void onWsMessage(const uint8_t* data, size_t size, bool binary)
             }
             else
             {
-                Serial.printf("[audio] unknown codec %u\n", data[1]);
+                LOG_W("[audio] unknown codec %u\n", data[1]);
             }
             return;
         }
-        Serial.printf("[ws] binary frame %u bytes\n", static_cast<unsigned>(size));
+        LOG_D("[ws] binary frame %u bytes\n", static_cast<unsigned>(size));
         return;
     }
 
     // Робот слушает WebSocket и выполняет команды протокола.
     const protocol::Command cmd =
         protocol::parse(reinterpret_cast<const char*>(data), size);
-    Serial.printf("[ws] text << %.*s\n", static_cast<int>(size),
-                  reinterpret_cast<const char*>(data));
+    LOG_D("[ws] text << %.*s\n", static_cast<int>(size),
+          reinterpret_cast<const char*>(data));
     handleCommand(cmd);
 }
 
