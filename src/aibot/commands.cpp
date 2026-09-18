@@ -8,9 +8,11 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cmath>
 #include <cstring>
 #include <deque>
 #include <freertos/queue.h>
+#include <freertos/semphr.h>
 #include <string>
 
 #include "app.h"
@@ -43,10 +45,42 @@ void sendResponse(const protocol::Command& cmd, bool ok, const char* reason = nu
     }
 }
 
+// ---------------------------------------------------------------------------
+// Синхронизация между задачами (playbackTask / loopTask / mic-задача I2S).
+//
+// gI2SMutex (recursive) — исключительный доступ к M5.Speaker/M5.Mic (общий
+// I2S CoreS3). Переключения делают playbackTask (ensureReady, barge-in,
+// probeMicWindow -> M5.Mic.record) и loopTask (gMic.stop/begin/start ->
+// M5.Mic begin/end). Без мьютекса gMic.stop() из loopTask (движение головы,
+// дисконнект, старт озвучки) мог бы сделать M5.Mic.end() прямо во время
+// M5.Mic.record() в окне прослушивания playbackTask — краш/мусор I2S.
+// probeMicWindow проверяет gMic.isRunning() строго ПОД I2S-мьютексом: если
+// mic-задача жива — окно отменяется. Т.е. record() в окне и mic-задача
+// физически не пересекаются.
+//
+// gAudioMutex (recursive) — gAudioChunk/gAudioFrame/gAudioChunkPackets/
+// gAudioChunkMaxBytes: наполняет mic-задача (onAudioSamples), чистит/шлёт
+// loopTask (startSegment/stopSegment/onWsDisconnected). Без него — data race
+// на std::vector при пересечении этих задач.
+//
+// Создаются в setupCommands(). Правило порядка блокировок:
+//   I2S/AUDIO -> WS-mutex (sendAudioChunk: AUDIO -> sendBinary(WS)).
+// Обратного порядка (WS -> I2S/AUDIO) в коде нет, поэтому взаимные
+// блокировки невозможны.
+// ---------------------------------------------------------------------------
+SemaphoreHandle_t gI2SMutex = nullptr;
+SemaphoreHandle_t gAudioMutex = nullptr;
+
+#define I2S_LOCK() xSemaphoreTakeRecursive(gI2SMutex, portMAX_DELAY)
+#define I2S_UNLOCK() xSemaphoreGiveRecursive(gI2SMutex)
+#define AUDIO_LOCK() xSemaphoreTakeRecursive(gAudioMutex, portMAX_DELAY)
+#define AUDIO_UNLOCK() xSemaphoreGiveRecursive(gAudioMutex)
+
 // Отправляет накопленный чанк как бинарный фрейм:
 // [0]=kAudioFrameType, [1]=kAudioCodecPcm, [2..]=сырые PCM-байты (int16 LE).
 void sendAudioChunk()
 {
+    AUDIO_LOCK();  // gAudioChunk/gAudioFrame делят mic-задача и loopTask
     // Без живого соединения не отправляем: микрофонная задача может наполнить
     // чанк, пока Wi-Fi/WebSocket уже разорвался, а send по битому сокету
     // падает с LoadProhibited. Чанк просто сбрасывается.
@@ -54,6 +88,7 @@ void sendAudioChunk()
     {
         gAudioChunk.clear();
         gAudioChunkPackets = 0;
+        AUDIO_UNLOCK();
         return;
     }
     const size_t payload = 2 + gAudioChunk.size();
@@ -66,6 +101,7 @@ void sendAudioChunk()
     out[1] = kAudioCodecPcm;
     std::memcpy(out + 2, gAudioChunk.data(), gAudioChunk.size());
     gWs.sendBinary(out, payload);
+    AUDIO_UNLOCK();
 }
 
 // Callback захвата микрофона: копит сырые PCM-байты (int16 LE, 16 кГц/моно)
@@ -90,7 +126,14 @@ volatile bool gPlaybackActive = false;
 // Момент блокировки VAD ожиданием озвучки (ставится в stopSegment).
 // Если сервер вообще не пришлёт аудио (пустой STT/ошибка), по таймауту
 // PLAYBACK_IDLE_TIMEOUT_MS блокировка снимается и микрофон возвращается.
-uint32_t gPlaybackBlockedAt = 0;
+// Пишут loopTask (stopSegment/enqueuePlayback) и playbackTask (barge-in),
+// читает loopTask — volatile против кеширования компилятором.
+volatile uint32_t gPlaybackBlockedAt = 0;
+// До этого момента времени (millis) входящие аудио-фреймы отбрасываются:
+// после barge-in сервер ещё шлёт хвост озвучки, пока не получит
+// PLAYBACK:INTERRUPT (BARGEIN_DROP_MS на RTT Wi-Fi).
+// Пишет playbackTask (barge-in), читает loopTask (onWsMessage) — volatile.
+volatile uint32_t gPlaybackStoppedUntil = 0;
 
 void resetPlaybackState();
 
@@ -103,6 +146,89 @@ void waitSpeakerIdle()
     {
         vTaskDelay(10);
     }
+}
+
+// Глобальные переменные VAD определены ниже (секция VAD) — forward-декларации
+// для probeMicWindow/playbackTask, которые используются раньше по тексту.
+extern float gVadThr;
+extern volatile unsigned gVadStartCount;
+
+// Окно прослушивания между чанками озвучки (barge-in): динамик полностью
+// выключается (AW88298 I2SEN=0, DMA остановлен), микрофон пишет серию
+// кадров и меряет RMS. Своего голоса робот не слышит — в окне динамик
+// молчит. True — пользователь говорит (уровень >= gVadThr * BARGEIN_RMS_GAIN
+// в BARGEIN_HIT_FRAMES кадрах) и хочет перебить робота.
+// Вызывается ТОЛЬКО из playbackTask. Всё тело выполняется под gI2SMutex:
+// loopTask (gMic.stop/begin) в это время не может трогать M5.Mic/M5.Speaker,
+// а проверка gMic.isRunning() именно под мьютексом исключает пересечение
+// с живой mic-задачей (если она слушает — окно просто отменяется).
+bool probeMicWindow()
+{
+#if BARGEIN_ENABLED
+    I2S_LOCK();
+    // Если микрофон уже слушает (VAD-задача активна) — окно отменяем:
+    // воспроизведение в этом состоянии не идёт, но защищаемся от гонки
+    // с gMic.start() (обе операции строго под gI2SMutex).
+    if (gMic.isRunning())
+    {
+        I2S_UNLOCK();
+        return false;
+    }
+    // 1. Глушим динамик и освобождаем I2S (как в EspMicrophone::begin).
+    if (M5.Speaker.isRunning())
+    {
+        M5.Speaker.end();
+        vTaskDelay(pdMS_TO_TICKS(10));  // драйверу освободить порт
+    }
+    // 2. Заводим микрофон с теми же настройками, что у VAD (gain x16).
+    auto micCfg = M5.Mic.config();
+    micCfg.sample_rate = MIC_SAMPLE_RATE;
+    micCfg.stereo = false;
+    micCfg.magnification = 32;
+    micCfg.over_sampling = 1;
+    M5.Mic.config(micCfg);
+    if (!M5.Mic.begin())
+    {
+        I2S_UNLOCK();
+        return false;
+    }
+    // 3. Стабилизация: пропускаем звон мембраны после выключения динамика.
+    vTaskDelay(pdMS_TO_TICKS(10));
+
+    constexpr size_t kFrame = 320;  // 20 мс @16 кГц (как MIC_FRAME_SAMPLES)
+    int16_t buf[kFrame];
+    const float thr = gVadThr * BARGEIN_RMS_GAIN;
+    unsigned hits = 0;
+    unsigned total = 0;
+    const uint32_t deadline = millis() + BARGEIN_WINDOW_MS;
+    while (millis() < deadline && total < 6)
+    {
+        if (!M5.Mic.record(buf, kFrame, MIC_SAMPLE_RATE))
+        {
+            break;
+        }
+        ++total;
+        uint64_t sum = 0;
+        for (size_t i = 0; i < kFrame; ++i)
+        {
+            const int32_t s = buf[i];
+            sum += static_cast<uint64_t>(s * s);
+        }
+        const float rms = std::sqrt(static_cast<float>(sum) / kFrame);
+        if (rms >= thr)
+        {
+            ++hits;
+        }
+        LOG_D("[barge] rms=%.0f thr=%.0f hits=%u/%u\n", rms, thr, hits, total);
+    }
+    // 4. Возвращаем шину динамику: следующий чанк включит его ensureReady().
+    M5.Mic.end();
+    vTaskDelay(pdMS_TO_TICKS(10));
+    I2S_UNLOCK();
+    return total > 0 && hits >= BARGEIN_HIT_FRAMES;
+#else
+    return false;
+#endif
 }
 
 void playbackTask(void* /*arg*/)
@@ -119,6 +245,7 @@ void playbackTask(void* /*arg*/)
     // ещё держит (published/playing, максимум 2). Все опубликованные ранее —
     // гарантированно доиграны, их буферы можно удалять сразу.
     std::deque<PlaybackMsg*> inflight;  // опубликованные в M5 чанки (по порядку)
+    unsigned chunkCount = 0;            // сыгранные чанки (для окон barge-in)
 
     while (true)
     {
@@ -148,7 +275,12 @@ void playbackTask(void* /*arg*/)
         {
             // Перед воспроизведением убеждаемся, что динамик инициализирован
             // (микрофон выключает его при переключении общего I2S на CoreS3).
-            if (!gSound.ensureReady())
+            // ensureReady делает M5.Mic.end() + M5.Speaker.begin() — под I2S,
+            // чтобы не пересечься с gMic.stop() из loopTask.
+            I2S_LOCK();
+            const bool spkReady = gSound.ensureReady();
+            I2S_UNLOCK();
+            if (!spkReady)
             {
                 LOG_W("[audio] speaker not ready, chunk skipped\n");
                 delete msg;
@@ -174,6 +306,39 @@ void playbackTask(void* /*arg*/)
                     delete inflight.front();
                     inflight.pop_front();
                 }
+            }
+            // Barge-in: после каждого N-го сыгранного чанка делаем окно
+            // прослушивания. Динамик глушится, микрофон слушает тишину —
+            // если пользователь говорит, озвучка обрывается мгновенно.
+            ++chunkCount;
+            // BARGEIN_EVERY_N_CHUNKS == 0 означает «никогда» — без деления
+            // на ноль; при BARGEIN_ENABLED=0 probeMicWindow вернёт false.
+            if (BARGEIN_EVERY_N_CHUNKS != 0 &&
+                chunkCount % BARGEIN_EVERY_N_CHUNKS == 0 &&
+                probeMicWindow())
+            {
+                // Останавливаем динамик и освобождаем все буферы: после
+                // end() M5.Speaker больше не читает их (DMA/AW88298 стоп).
+                I2S_LOCK();
+                M5.Speaker.end();
+                I2S_UNLOCK();
+                for (auto* m : inflight) { delete m; }
+                inflight.clear();
+                PlaybackMsg* qm = nullptr;
+                while (xQueueReceive(gPlayQ, &qm, 0) == pdTRUE) { delete qm; }
+                gPlaybackActive = false;
+                gPlaybackBlockedAt = 0;
+                gVadStartCount = 0;
+                // Сервер ещё шлёт хвост озвучки, пока не получит
+                // PLAYBACK:INTERRUPT, — игнорируем эти фреймы.
+                gPlaybackStoppedUntil = millis() + BARGEIN_DROP_MS;
+                if (gWs.isConnected())
+                {
+                    gWs.sendText("PLAYBACK:INTERRUPT");
+                }
+                Serial.println("[audio] barge-in: озвучка прервана, "
+                               "микрофон к VAD");
+                continue;
             }
         }
         else
@@ -235,10 +400,11 @@ void onAudioSamples(const int16_t* data, size_t samples)
     {
         return;
     }
-    // Накопление и отправка PCM — всё в I2S-задаче микрофона: буфер
-    // gAudioChunk однопотоковый. Гонка за WebSocket-клиент исключена
-    // мьютексом на отправках (см. websocket.h): sendBinary из этой задачи
-    // и sendText из loopTask сериализуются.
+    // Накопление и отправка PCM — в I2S-задаче микрофона. gAudioChunk также
+    // трогает loopTask (startSegment/stopSegment/onWsDisconnected), поэтому
+    // всё тело — под gAudioMutex (рекурсивный: sendAudioChunk берёт его же).
+    // Гонка за WebSocket-клиент — мьютексом на отправках (см. websocket.h).
+    AUDIO_LOCK();
     const size_t bytes = samples * sizeof(int16_t);
     if (gAudioChunk.size() + bytes > gAudioChunkMaxBytes)
     {
@@ -249,6 +415,7 @@ void onAudioSamples(const int16_t* data, size_t samples)
     const uint8_t* raw = reinterpret_cast<const uint8_t*>(data);
     gAudioChunk.insert(gAudioChunk.end(), raw, raw + bytes);
     ++gAudioChunkPackets;
+    AUDIO_UNLOCK();
 }
 
 // ---------------------------------------------------------------------------
@@ -264,7 +431,8 @@ float gVadThr = VAD_MIN_THRESHOLD;  // текущий порог детекци�
 bool gVadActive = false;        // идёт VAD-сегмент записи
 uint32_t gVadSegStartMs = 0;    // время начала сегмента
 uint32_t gVadSpeechMs = 0;      // время последнего «речевого» кадра
-unsigned gVadStartCount = 0;    // кадры подряд выше порога
+volatile unsigned gVadStartCount = 0;  // кадры подряд выше порога
+                    // пишут loopTask (tickVad) и playbackTask (barge-in) — volatile
 
 // Флаг «голова двигается»: ставит motionTask (ядро 0), снимает по завершении
 // серии движений. Читает только loopTask (tickAudioInternal) — микрофон/VAD
@@ -306,8 +474,11 @@ void startSegment()
         gVadStartCount = 0;  // нет связи — речь не пишем
         return;
     }
+    // gAudioChunk трогает и mic-задача — под тем же мьютексом.
+    AUDIO_LOCK();
     gAudioChunk.clear();
     gAudioChunkPackets = 0;
+    AUDIO_UNLOCK();
     gAudioCapturing = true;
     gVadActive = true;
     gVadSegStartMs = millis();
@@ -328,10 +499,13 @@ void stopSegment()
     {
         gWs.sendText("RECORD:stop");
     }
-    // Последний неполный чанк (sendAudioChunk сам проверит соединение).
+    // Последний неполный чанк (sendAudioChunk сам проверит соединение):
+    // под gAudioMutex — накопление могло идти из mic-задачи параллельно.
+    AUDIO_LOCK();
     sendAudioChunk();
     gAudioChunk.clear();
     gAudioChunkPackets = 0;
+    AUDIO_UNLOCK();
     Serial.println("[vad] speech ended -> RECORD:stop");
 
     // Блокируем VAD до прихода озвучки ответа: иначе застывший RMS ещё
@@ -401,14 +575,21 @@ void ensureMicListening()
     cfg.noiseGateThreshold = MIC_NOISE_THRESHOLD;
     cfg.hangoverFrames = MIC_HANGOVER_FRAMES;
 
+    // gAudioChunkMaxBytes читает mic-задача — запись под тем же мьютексом.
+    AUDIO_LOCK();
     gAudioChunkMaxBytes = MIC_SAMPLE_RATE * 2u * MIC_AUDIO_CHUNK_SECONDS;
+    AUDIO_UNLOCK();
 
+    // begin/start трогают M5.Speaker/M5.Mic (общий I2S) — под gI2SMutex,
+    // чтобы не пересечься с playbackTask (ensureReady/probeMicWindow).
+    I2S_LOCK();
     if (gMic.begin(cfg))
     {
         gMic.setNoiseLevelCallback([](float rms) { gLatestRms = rms; });
         gMic.start(onAudioSamples);
         Serial.println("[mic] listening (VAD)");
     }
+    I2S_UNLOCK();
 }
 
 // Периодический heartbeat (робот -> сервер): маленький текстовый фрейм "HB"
@@ -455,10 +636,15 @@ void tickAudioInternal()
         {
             stopSegment();  // корректно закрыть активную запись
         }
+        // gMic.stop() делает M5.Mic.end() — под gI2SMutex, чтобы не
+        // пересечься с окном прослушивания playbackTask (движение может
+        // идти во время озвучки, например при танце).
+        I2S_LOCK();
         if (gMic.isRunning())
         {
             gMic.stop();
         }
+        I2S_UNLOCK();
         return;
     }
     ensureMicListening();
@@ -484,12 +670,18 @@ void onWsDisconnected(uint16_t code, const std::string& reason)
     // в разорванный WebSocket -> краш (LoadProhibited).
     gVadActive = false;
     gAudioCapturing = false;
+    // Чистка PCM-буфера под gAudioMutex — mic-задача может писать параллельно.
+    AUDIO_LOCK();
     gAudioChunk.clear();
     gAudioChunkPackets = 0;
+    AUDIO_UNLOCK();
+    // Остановка микрофона (M5.Mic.end) — под gI2SMutex.
+    I2S_LOCK();
     if (gMic.isRunning())
     {
         gMic.stop();
     }
+    I2S_UNLOCK();
     if (gState == AppState::kReady || gState == AppState::kConnecting)
     {
         transition(AppState::kWifiLost);
@@ -656,13 +848,25 @@ void onWsMessage(const uint8_t* data, size_t size, bool binary)
         // [2..]=сырые сэмплы int16 LE (16 кГц/моно).
         if (size >= 2 && data[0] == kAudioFrameType)
         {
+            // После barge-in сервер ещё шлёт хвост озвучки, пока не получил
+            // PLAYBACK:INTERRUPT. Фреймы отбрасываем, микрофон не трогаем:
+            // он уже вернулся к VAD — пользователь перебил робота.
+            if (millis() < gPlaybackStoppedUntil)
+            {
+                LOG_D("[audio] chunk dropped (post barge-in)\n");
+                return;
+            }
             // Динамик и микрофон делят I2S на CoreS3: перед воспроизведением
             // останавливаем прослушивание микрофона, если оно идёт.
+            // stop() делает M5.Mic.end() — под gI2SMutex, чтобы не пересечься
+            // с окном прослушивания playbackTask.
+            I2S_LOCK();
             if (gMic.isRunning())
             {
                 gMic.stop();
                 Serial.println("[audio] mic stopped (playback)");
             }
+            I2S_UNLOCK();
             // Динамик включается позже, в playbackTask, через gSound.ensureReady()
             // (после M5.Mic.end() порту I2S нужно время на освобождение).
 
@@ -700,6 +904,10 @@ void tickAudio()
 
 void setupCommands()
 {
+    // Рекурсивные мьютексы синхронизации задач (см. объявление выше):
+    // создаются один раз до старта loopTask/playbackTask/mic-задачи.
+    gI2SMutex = xSemaphoreCreateRecursiveMutex();
+    gAudioMutex = xSemaphoreCreateRecursiveMutex();
     gWs.setConnectedCallback(onWsConnected);
     gWs.setDisconnectedCallback(onWsDisconnected);
     gWs.setMessageCallback(onWsMessage);
